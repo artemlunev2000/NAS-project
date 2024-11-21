@@ -10,7 +10,7 @@ if __name__ == '__main__':
 
     graph = CustomGraph(in_nodes_number, out_nodes_number, 0)
     graph.visualize("Initial")
-    graph.add_new_nodes_with_edges(in_nodes_number, edges_list=[(i, in_nodes_number) for i in range(in_nodes_number)])
+    graph.add_new_nodes_with_edges(edges_list=[(i, in_nodes_number) for i in range(in_nodes_number)])
     graph.visualize('Added conv layer nodes')
     node_indexes_map = {node: (node % data_shape[0], node // data_shape[1]) for node in range(in_nodes_number)}
     indexes_node_map = {indexes: node for node, indexes in node_indexes_map.items()}
@@ -29,13 +29,13 @@ if __name__ == '__main__':
                         conv_layer_edges.append(edge)
                     weight_groups[(h + 1) + (w + 1)*kernel_length].append(edge)
 
-    graph.add_new_edges(len(conv_layer_edges), conv_layer_edges)
+    graph.add_new_edges(conv_layer_edges)
     graph.visualize('Added conv layer edges')
     graph.add_new_weights_duplicates_from_map(weight_groups)
     graph.visualize('Added weights sets')
 
     snd_layer_edges = [(i + in_nodes_number + out_nodes_number, in_nodes_number) for i in range(in_nodes_number)]
-    graph.split_edges_with_node(len(snd_layer_edges), snd_layer_edges)
+    graph.split_edges_with_node(snd_layer_edges)
     graph.visualize('Split edges')
 
     second_conv_layer_edges = []
@@ -54,7 +54,7 @@ if __name__ == '__main__':
                         second_conv_layer_edges.append(edge)
                     second_weight_groups[(h + 1) + (w + 1) * kernel_length + kernel_length**2].append(edge)
 
-    graph.add_new_edges(len(second_conv_layer_edges), second_conv_layer_edges)
+    graph.add_new_edges(second_conv_layer_edges)
     graph.visualize('Added second conv layer edges')
     graph.add_new_weights_duplicates_from_map(second_weight_groups)
     graph.visualize('Added second weights sets')
@@ -65,14 +65,14 @@ if __name__ == '__main__':
         for node_to in range(in_nodes_number, in_nodes_number + out_nodes_number)
         if not graph.graph.has_edge(node_from, node_to)
     ]
-    graph.add_new_edges(len(fully_connected_edges), fully_connected_edges)
+    graph.add_new_edges(fully_connected_edges)
     graph.visualize('Added fully connected edges')
 
     residual_edges = list(zip(
         range(in_nodes_number),
         range(in_nodes_number*2 + out_nodes_number, in_nodes_number*3 + out_nodes_number)
     ))
-    graph.add_new_edges(len(residual_edges), residual_edges)
+    graph.add_new_edges(residual_edges)
     graph.visualize('Added residual edges')
     graph.add_new_weights_duplicates_from_map({1: residual_edges})
     graph.visualize('Added residual weights set')

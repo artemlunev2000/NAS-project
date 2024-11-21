@@ -1,9 +1,11 @@
+import random
 import tensorflow as tf
 import pickle
 import uuid
 import os
 from copy import deepcopy
 from collections import defaultdict
+from scipy.interpolate import RegularGridInterpolator
 
 from src.graph_utils import CustomGraph
 from src.model_generator import create_model_from_graph, update_graph_weights, CustomDenseLayer
@@ -44,11 +46,11 @@ def architecture_search(
         for i in range(architectures_sampling_per_iteration):
             current_graph = copied_graphs[i]
 
-            current_graph.add_new_weights_duplicates(1, current_graph.graph.number_of_edges() // 70)
-            current_graph.add_new_nodes_with_edges(current_graph.graph.number_of_nodes() // 3)
-            current_graph.add_new_edges(current_graph.graph.number_of_edges())
-            current_graph.remove_edges(current_graph.graph.number_of_edges() // 15)
-            # current_graph.split_edges_with_node(current_graph.graph.number_of_edges() // 20)
+            current_graph.add_new_weights_duplicates(1)
+            current_graph.add_new_nodes_with_edges()
+            current_graph.add_new_edges()
+            current_graph.remove_edges()
+            current_graph.split_edges_with_node()
 
             (
                 current_model,
@@ -89,7 +91,118 @@ def architecture_search(
     print(f'Final test accuracy - {test_accuracy}')
 
 
-def train_model(model, train_dataset, val_dataset, duplicated_weights_edges_map, duplicated_weights_groups, epochs=30):
+def get_metric_function():
+    params_numbers = [1000, 3000, 10000, 23000, 100000, 180000, 350000]
+    accuracies = [92, 94, 95, 96, 97, 98, 99, 100]
+    expected_metric_values = [[-0.4, -0.2, 0, 2, 5, 10, 15, 20],
+                              [-1.5, -0.9, -0.5, -0.2, 0, 1, 4, 10],
+                              [-3, -2, -1.5, -1.2, -0.5, 0, 2, 5],
+                              [-4, -2.5, -1.8, -1.4, -1, -0.4, 0, 3],
+                              [-6, -4, -3, -1.8, -1.2, -0.6, -0.1, 2],
+                              [-7, -5.5, -3.3, -1.9, -1.4, -0.8, -0.4, 1],
+                              [-8, -6, -4, -2.2, -1.6, -1, -0.6, 0.5]]
+    return RegularGridInterpolator(
+        (params_numbers, accuracies),
+        expected_metric_values,
+        bounds_error=False,
+        fill_value=None
+    )
+
+
+def optimized_architecture_search(
+    train_dataset, val_dataset, test_dataset,
+    input_nodes: int, output_nodes: int,
+    iterations_number: int = 10, mutations_per_iteration: int = 15,
+    initial_population_number: int = 60, start_population_file: str = None
+):
+    graphs_folder = f'graphs_savings/evolution/{uuid.uuid4()}'
+    os.makedirs(graphs_folder, exist_ok=True)
+
+    metric_fn = get_metric_function()
+
+    if start_population_file:
+        with open(start_population_file, "rb") as file:
+            population = pickle.load(file)
+    else:
+        population = []
+
+    for _ in range(initial_population_number):
+        graph = CustomGraph(
+            in_units=input_nodes,
+            out_units=output_nodes,
+            edges_num=0
+        )
+        graph.add_new_nodes_with_edges()
+        graph.add_new_weights_duplicates(6, 0)
+
+        model, duplicated_weights_edges_map, net_graph_weights_mapping, net_graph_biases_mapping = \
+            create_model_from_graph(graph, normalization='layer')
+        train_model(model, train_dataset, val_dataset, duplicated_weights_edges_map, graph.duplicated_weights_groups,
+                    epochs=60)
+        update_graph_weights(graph, net_graph_weights_mapping, net_graph_biases_mapping)
+        model.compile(loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        _, val_accuracy = model.evaluate(val_dataset)
+        graph_id = uuid.uuid4()
+        population.append({
+            'graph_id': graph_id, 'metric': metric_fn([graph.parameters_number, val_accuracy * 100])[0],
+            'acc': val_accuracy, 'parameters': graph.parameters_number, 'actions': []
+        })
+        with open(f"{graphs_folder}/{graph_id}.pkl", "wb") as file:
+            pickle.dump(graph, file)
+        with open(f"{graphs_folder}/0.pkl", "wb") as file:
+            pickle.dump(population, file)
+
+    for iteration in range(iterations_number):
+        models_to_mutate = deepcopy(random.sample(population, mutations_per_iteration))
+        for model_info in models_to_mutate:
+            with open(f'{graphs_folder}/{model_info["graph_id"]}.pkl', "rb") as file:
+                graph = pickle.load(file)
+
+            action = random.randint(0, 5)
+            if action == 0:
+                graph.add_new_edges()
+            elif action == 1:
+                graph.add_new_nodes_with_edges()
+            elif action == 2 and graph.duplicated_weights_groups:
+                graph.add_new_weights_duplicates(0)
+            elif action == 3:
+                graph.add_new_weights_duplicates(1)
+            elif action == 4:
+                graph.remove_edges()
+            elif action == 5:
+                graph.split_edges_with_node()
+
+            (
+                model,
+                duplicated_weights_edges_map,
+                net_graph_weights_mapping,
+                net_graph_biases_mapping
+            ) = create_model_from_graph(graph, normalization='layer')
+
+            train_model(
+                model, train_dataset, val_dataset,
+                duplicated_weights_edges_map, graph.duplicated_weights_groups
+            )
+            update_graph_weights(graph, net_graph_weights_mapping, net_graph_biases_mapping)
+            model.compile(loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+            _, val_accuracy = model.evaluate(val_dataset)
+            graph_id = uuid.uuid4()
+            population.append({
+                'graph_id': graph_id, 'metric': metric_fn([graph.parameters_number, val_accuracy * 100])[0],
+                'acc': val_accuracy, 'parameters': graph.parameters_number, 'actions': model_info['actions'] + [action]
+            })
+            with open(f"{graphs_folder}/{graph_id}.pkl", "wb") as file:
+                pickle.dump(graph, file)
+            with open(f"{graphs_folder}/{iteration + 1}.pkl", "wb") as file:
+                pickle.dump(population, file)
+
+        population = sorted(population, key=lambda x: x['metric'])
+        population = population[mutations_per_iteration:]
+        with open(f"{graphs_folder}/{iteration + 1}.pkl", "wb") as file:
+            pickle.dump(population, file)
+
+
+def train_model(model, train_dataset, val_dataset, duplicated_weights_edges_map, duplicated_weights_groups, epochs=50):
     @tf.function
     def train_step(train_images, train_labels):
         with tf.GradientTape() as tape:
@@ -147,7 +260,9 @@ def train_model(model, train_dataset, val_dataset, duplicated_weights_edges_map,
     val_loss = tf.keras.metrics.Mean()
     val_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
 
+    best_accuracy, accuracy_not_updated = 0, 0
     for epoch in range(epochs):
+        accuracy_not_updated += 1
         train_loss.reset_states()
         train_accuracy.reset_states()
         val_loss.reset_states()
@@ -158,6 +273,13 @@ def train_model(model, train_dataset, val_dataset, duplicated_weights_edges_map,
 
         for images, labels in val_dataset:
             val_step(images, labels)
+
+        if val_accuracy.result() > best_accuracy:
+            best_accuracy = val_accuracy.result()
+            accuracy_not_updated = 0
+
+        if accuracy_not_updated > 5:
+            break
 
         print(
             f"Epoch {epoch + 1}, "

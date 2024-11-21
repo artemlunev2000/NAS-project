@@ -22,7 +22,7 @@ class CustomDenseLayer(tf.keras.layers.Layer):
         return tf.matmul(inputs, masked_w) + self.b if self.with_biases else tf.matmul(inputs, masked_w)
 
 
-def create_model_from_graph(graph: CustomGraph):
+def create_model_from_graph(graph: CustomGraph, normalization='layer'):
     node_layer_map = graph.node_layer_map
     last_layer_number = max(node_layer_map.values())
     inputs = tf.keras.Input(shape=(len(graph.in_nodes),))
@@ -88,13 +88,19 @@ def create_model_from_graph(graph: CustomGraph):
     layers_results = [inputs]
     for current_layer in range(1, last_layer_number + 1):
         activation = tf.keras.activations.softmax if current_layer == last_layer_number else tf.keras.activations.relu
-        layer_result = activation(
+        layer_result = \
             tf.reduce_sum(
                 [keras_layers[current_layer][layer_from](layers_results[layer_from])
                  for layer_from in keras_layers[current_layer].keys()],
                 axis=0
             )
-        )
+        if normalization and current_layer != last_layer_number:
+            if normalization == 'batch':
+                layer_result = tf.keras.layers.BatchNormalization()(layer_result)
+            elif normalization == 'layer':
+                layer_result = tf.keras.layers.LayerNormalization(center=False, scale=False)(layer_result)
+
+        layer_result = activation(layer_result)
         layers_results.append(layer_result)
 
     return tf.keras.Model(inputs=inputs, outputs=layers_results[-1]), \

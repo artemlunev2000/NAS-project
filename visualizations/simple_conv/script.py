@@ -10,7 +10,7 @@ if __name__ == '__main__':
 
     graph = CustomGraph(in_nodes_number, out_nodes_number, 0)
     graph.visualize("Initial")
-    graph.add_new_nodes_with_edges(in_nodes_number, edges_list=[(i, in_nodes_number) for i in range(in_nodes_number)])
+    graph.add_new_nodes_with_edges(edges_list=[(i, in_nodes_number) for i in range(in_nodes_number)])
     graph.visualize('Added conv layer nodes')
     node_indexes_map = {node: (node % data_shape[0], node // data_shape[1]) for node in range(in_nodes_number)}
     indexes_node_map = {indexes: node for node, indexes in node_indexes_map.items()}
@@ -29,7 +29,7 @@ if __name__ == '__main__':
                         conv_layer_edges.append(edge)
                     weight_groups[(h + 1) + (w + 1)*kernel_length].append(edge)
 
-    graph.add_new_edges(len(conv_layer_edges), conv_layer_edges)
+    graph.add_new_edges(conv_layer_edges)
     graph.visualize('Added conv layer edges')
     fully_connected_edges = [
         (node_from, node_to)
@@ -37,7 +37,7 @@ if __name__ == '__main__':
         for node_to in range(in_nodes_number, in_nodes_number + out_nodes_number)
         if not graph.graph.has_edge(node_from, node_to)
     ]
-    graph.add_new_edges(len(fully_connected_edges), fully_connected_edges)
+    graph.add_new_edges(fully_connected_edges)
     graph.visualize('Added fully connected edges')
     graph.add_new_weights_duplicates_from_map(weight_groups)
     graph.visualize('Added weights sets')
