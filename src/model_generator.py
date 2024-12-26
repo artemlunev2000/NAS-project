@@ -1,6 +1,7 @@
+import numpy as np
 import tensorflow as tf
 from collections import Counter, defaultdict
-from typing import Dict
+from typing import Dict, List
 
 from src.graph_utils import CustomGraph
 
@@ -8,21 +9,52 @@ from src.graph_utils import CustomGraph
 class CustomDenseLayer(tf.keras.layers.Layer):
     def __init__(self, shape: tuple, with_biases: bool):
         super(CustomDenseLayer, self).__init__()
-        self.w = tf.Variable(tf.keras.initializers.GlorotUniform()(shape=shape), name='weights')
+        self.dense_shape = shape
+        self.sparse_indexes = None
+        self.w = None
+        self.running_mode = None
+        self.sparsity_mask = None
         self.with_biases = with_biases
 
         if self.with_biases:
             self.b = tf.Variable(tf.zeros([shape[-1]]), name='bias')
         else:
             self.b = None
-        self.sparsity_mask = tf.Variable(tf.zeros(shape), trainable=False)
+
+    def fixate_weights(self, sparse_indexes: List[tuple], flatten_weights: list):
+        if len(sparse_indexes) < self.dense_shape[0] * self.dense_shape[1] * 0.05:
+            self.running_mode = 'sparse'
+            self.sparse_indexes = tf.constant(sparse_indexes, dtype=tf.int64)
+            if not flatten_weights:
+                limit = tf.sqrt(6.0 / (self.dense_shape[0] + self.dense_shape[1]))
+                flatten_weights = tf.random.uniform(shape=(len(sparse_indexes),),
+                                                    minval=-limit,
+                                                    maxval=limit,
+                                                    dtype=tf.float32)
+            self.w = tf.Variable(flatten_weights, trainable=True, name='w')
+        else:
+            self.running_mode = 'masked'
+            self.w = tf.Variable(tf.keras.initializers.GlorotUniform()(shape=self.dense_shape), name='w')
+            if flatten_weights:
+                self.w.scatter_nd_update(sparse_indexes, flatten_weights)
+            self.sparsity_mask = tf.zeros(self.dense_shape, dtype=tf.float32)
+            self.sparsity_mask = tf.tensor_scatter_nd_update(
+                self.sparsity_mask, sparse_indexes, tf.ones(len(sparse_indexes), dtype=tf.float32)
+            )
 
     def call(self, inputs):
-        masked_w = self.w * self.sparsity_mask
-        return tf.matmul(inputs, masked_w) + self.b if self.with_biases else tf.matmul(inputs, masked_w)
+        if self.running_mode == 'sparse':
+            sparse_weights = tf.sparse.SparseTensor(indices=self.sparse_indexes,
+                                                    values=self.w,
+                                                    dense_shape=self.dense_shape)
+            return tf.sparse.sparse_dense_matmul(inputs, sparse_weights) + self.b if self.with_biases else \
+                tf.sparse.sparse_dense_matmul(inputs, sparse_weights)
+        else:
+            masked_w = self.w * self.sparsity_mask
+            return tf.matmul(inputs, masked_w) + self.b if self.with_biases else tf.matmul(inputs, masked_w)
 
 
-def create_model_from_graph(graph: CustomGraph, normalization='layer'):
+def create_model_from_graph(graph: CustomGraph, normalization='layer', without_start_weights=False):
     node_layer_map = graph.node_layer_map
     last_layer_number = max(node_layer_map.values())
     inputs = tf.keras.Input(shape=(len(graph.in_nodes),))
@@ -45,28 +77,35 @@ def create_model_from_graph(graph: CustomGraph, normalization='layer'):
 
     # Init layers with weights from graph and create mapping between net and graph to save connection between them
     layer_nodes_map = defaultdict(list)
+    layer_neurons_map = {}
     for node in sorted(node_layer_map.keys()):
         layer_nodes_map[node_layer_map[node]].append(node)
 
     for layer in layer_nodes_map.keys():
         layer_nodes_map[layer] = sorted(layer_nodes_map[layer])
+        layer_neurons_map[layer] = {node: i for i, node in enumerate(layer_nodes_map[layer])}
 
     net_graph_weights_mapping = {}
     net_graph_biases_mapping = {}
     duplicated_weights_edges_map = {}
+    layers_arrays = {
+        layer: {'sparse_indexes': [], 'w': np.array(layer.dense_shape)}
+        for layer in (v for sub_dict in keras_layers.values() for v in sub_dict.values())
+    }
     for u, v, data in graph.graph.edges(data=True):
         if u not in node_layer_map or v not in node_layer_map:
             continue
 
         u_layer, v_layer = node_layer_map[u], node_layer_map[v]
-        u_neuron_number, v_neuron_number = layer_nodes_map[u_layer].index(u), layer_nodes_map[v_layer].index(v)
+        u_neuron_number, v_neuron_number = layer_neurons_map[u_layer][u], layer_neurons_map[v_layer][v]
         keras_layer = keras_layers[v_layer][u_layer]
-
-        if 'weight' in data and data['weight'] is not None:
-            keras_layer.w[u_neuron_number, v_neuron_number].assign(data['weight'])
-        keras_layer.sparsity_mask[u_neuron_number, v_neuron_number].assign(1)
+        if 'weight' in data and data['weight'] is not None and not without_start_weights:
+            layers_arrays[keras_layer]['w'][u_neuron_number, v_neuron_number] = data['weight']
+        layers_arrays[keras_layer]['sparse_indexes'].append([u_neuron_number, v_neuron_number])
         net_graph_weights_mapping[(keras_layer, u_neuron_number, v_neuron_number)] = (u, v)
         if (u, v) in graph.duplicated_weights_edges:
+            if without_start_weights:
+                layers_arrays[keras_layer]['w'][u_neuron_number, v_neuron_number] = 1e-3
             duplicated_weights_edges_map[(u, v)] = {
                 'layer': keras_layer,
                 'neuron_indexes': (u_neuron_number, v_neuron_number)
@@ -77,12 +116,16 @@ def create_model_from_graph(graph: CustomGraph, normalization='layer'):
             continue
 
         u_layer = node_layer_map[u]
-        u_neuron_number = layer_nodes_map[u_layer].index(u)
+        u_neuron_number = layer_neurons_map[u_layer][u]
         keras_layer = keras_layers[u_layer][u_layer - 1]
 
-        if 'weight' in data and data['weight'] is not None:
-            keras_layer.b[u_neuron_number].assign(data['weight'])
+        if 'weight' in data and data['weight'] is not None and not without_start_weights:
+            layers_arrays[keras_layer]['b'][u_neuron_number] = data['weight']
         net_graph_biases_mapping[(keras_layer, u_neuron_number)] = u
+
+    for keras_layer, arrays in layers_arrays.items():
+        flatten_weights = [arrays['w'][ind] for ind in arrays['sparse_indexes']] if not without_start_weights else []
+        keras_layer.fixate_weights(sparse_indexes=arrays['sparse_indexes'], flatten_weights=flatten_weights)
 
     # Calculating outputs
     layers_results = [inputs]
