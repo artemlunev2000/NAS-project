@@ -9,7 +9,7 @@ from src.graph_utils import CustomGraph
 
 def create_graph(in_shape: tuple, out_nodes: int, layers_config: List[dict]):
     in_units = math.prod(in_shape)
-    graph = CustomGraph(in_units=in_units, out_units=out_nodes, edges_num=0)
+    graph = CustomGraph(in_units=in_units, out_units=out_nodes)
     current_nodes = np.array([i for i in range(in_units)]).reshape(in_shape)
 
     for layer_config in layers_config:

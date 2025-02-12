@@ -1,4 +1,3 @@
-import numpy as np
 import tensorflow as tf
 from collections import Counter, defaultdict
 from typing import Dict, List
@@ -11,36 +10,50 @@ class CustomDenseLayer(tf.keras.layers.Layer):
         super(CustomDenseLayer, self).__init__()
         self.dense_shape = shape
         self.sparse_indexes = None
+        self.sparse_indexes_map = None
         self.w = None
         self.running_mode = None
-        self.sparsity_mask = None
         self.with_biases = with_biases
 
         if self.with_biases:
             self.b = tf.Variable(tf.zeros([shape[-1]]), name='bias')
         else:
             self.b = None
+        self.sparsity_mask = None
 
-    def fixate_weights(self, sparse_indexes: List[tuple], flatten_weights: list):
+    def fixate_weights(self, sparse_indexes: List[tuple], flatten_weights: list, b: list):
+        assert flatten_weights is None or len(sparse_indexes) == len(flatten_weights)
         if len(sparse_indexes) < self.dense_shape[0] * self.dense_shape[1] * 0.05:
             self.running_mode = 'sparse'
             self.sparse_indexes = tf.constant(sparse_indexes, dtype=tf.int64)
-            if not flatten_weights:
-                limit = tf.sqrt(6.0 / (self.dense_shape[0] + self.dense_shape[1]))
-                flatten_weights = tf.random.uniform(shape=(len(sparse_indexes),),
-                                                    minval=-limit,
-                                                    maxval=limit,
-                                                    dtype=tf.float32)
-            self.w = tf.Variable(flatten_weights, trainable=True, name='w')
+            self.sparse_indexes_map = {tuple(ind): i for i, ind in enumerate(sparse_indexes)}
+
+            limit = tf.sqrt(6.0 / (self.dense_shape[0] + self.dense_shape[1]))
+            weights = tf.random.uniform(shape=(len(sparse_indexes),),
+                                        minval=-limit,
+                                        maxval=limit,
+                                        dtype=tf.float32)
+            if flatten_weights is not None and [w for w in flatten_weights if w is not None]:
+                weights = tf.tensor_scatter_nd_update(
+                    weights, [[i] for i in range(len(sparse_indexes)) if flatten_weights[i] is not None],
+                    [w for w in flatten_weights if w is not None]
+                )
+            self.w = tf.Variable(weights, trainable=True, name='w')
         else:
             self.running_mode = 'masked'
             self.w = tf.Variable(tf.keras.initializers.GlorotUniform()(shape=self.dense_shape), name='w')
-            if flatten_weights:
-                self.w.scatter_nd_update(sparse_indexes, flatten_weights)
+            if flatten_weights is not None and [w for w in flatten_weights if w is not None]:
+                self.w.scatter_nd_update(
+                    [ind for i, ind in enumerate(sparse_indexes) if flatten_weights[i] is not None],
+                    [w for w in flatten_weights if w is not None]
+                )
             self.sparsity_mask = tf.zeros(self.dense_shape, dtype=tf.float32)
             self.sparsity_mask = tf.tensor_scatter_nd_update(
                 self.sparsity_mask, sparse_indexes, tf.ones(len(sparse_indexes), dtype=tf.float32)
             )
+
+        if b is not None and self.with_biases:
+            self.b.assign(b)
 
     def call(self, inputs):
         if self.running_mode == 'sparse':
@@ -89,7 +102,8 @@ def create_model_from_graph(graph: CustomGraph, normalization='layer', without_s
     net_graph_biases_mapping = {}
     duplicated_weights_edges_map = {}
     layers_arrays = {
-        layer: {'sparse_indexes': [], 'w': np.array(layer.dense_shape)}
+        layer: {'sparse_indexes': [], 'b': layer.b.numpy() if layer.with_biases else None,
+                'flatten_weights': [] if not without_start_weights else None}
         for layer in (v for sub_dict in keras_layers.values() for v in sub_dict.values())
     }
     for u, v, data in graph.graph.edges(data=True):
@@ -100,12 +114,12 @@ def create_model_from_graph(graph: CustomGraph, normalization='layer', without_s
         u_neuron_number, v_neuron_number = layer_neurons_map[u_layer][u], layer_neurons_map[v_layer][v]
         keras_layer = keras_layers[v_layer][u_layer]
         if 'weight' in data and data['weight'] is not None and not without_start_weights:
-            layers_arrays[keras_layer]['w'][u_neuron_number, v_neuron_number] = data['weight']
+            layers_arrays[keras_layer]['flatten_weights'].append(data['weight'])
+        elif not without_start_weights:
+            layers_arrays[keras_layer]['flatten_weights'].append(None)
         layers_arrays[keras_layer]['sparse_indexes'].append([u_neuron_number, v_neuron_number])
         net_graph_weights_mapping[(keras_layer, u_neuron_number, v_neuron_number)] = (u, v)
         if (u, v) in graph.duplicated_weights_edges:
-            if without_start_weights:
-                layers_arrays[keras_layer]['w'][u_neuron_number, v_neuron_number] = 1e-3
             duplicated_weights_edges_map[(u, v)] = {
                 'layer': keras_layer,
                 'neuron_indexes': (u_neuron_number, v_neuron_number)
@@ -119,13 +133,14 @@ def create_model_from_graph(graph: CustomGraph, normalization='layer', without_s
         u_neuron_number = layer_neurons_map[u_layer][u]
         keras_layer = keras_layers[u_layer][u_layer - 1]
 
-        if 'weight' in data and data['weight'] is not None and not without_start_weights:
+        if 'weight' in data and data['weight'] is not None and keras_layer.with_biases and not without_start_weights:
             layers_arrays[keras_layer]['b'][u_neuron_number] = data['weight']
         net_graph_biases_mapping[(keras_layer, u_neuron_number)] = u
 
-    for keras_layer, arrays in layers_arrays.items():
-        flatten_weights = [arrays['w'][ind] for ind in arrays['sparse_indexes']] if not without_start_weights else []
-        keras_layer.fixate_weights(sparse_indexes=arrays['sparse_indexes'], flatten_weights=flatten_weights)
+    for keras_layer, np_arrays in layers_arrays.items():
+        keras_layer.fixate_weights(
+            sparse_indexes=np_arrays['sparse_indexes'], flatten_weights=np_arrays['flatten_weights'], b=np_arrays['b']
+        )
 
     # Calculating outputs
     layers_results = [inputs]
@@ -144,6 +159,8 @@ def create_model_from_graph(graph: CustomGraph, normalization='layer', without_s
                 layer_result = tf.keras.layers.LayerNormalization(center=False, scale=False)(layer_result)
 
         layer_result = activation(layer_result)
+        if current_layer != last_layer_number:
+            layer_result = tf.keras.layers.Dropout(0.2)(layer_result)
         layers_results.append(layer_result)
 
     return tf.keras.Model(inputs=inputs, outputs=layers_results[-1]), \
@@ -158,11 +175,15 @@ def update_graph_weights(
     net_graph_biases_mapping: Dict[tuple, int]
 ):
     """Updates graph weights after network training to keep them in actual state"""
+    layers_np_weights = {layer: layer.w.numpy() for (layer, _, _) in net_graph_weights_mapping.keys()}
 
     for (layer, ind1, ind2), (node1, node2) in net_graph_weights_mapping.items():
-        graph.graph[node1][node2]['weight'] = layer.w[ind1, ind2]
+        if layer.running_mode == 'sparse':
+            graph.graph[node1][node2]['weight'] = layers_np_weights[layer][layer.sparse_indexes_map[(ind1, ind2)]]
+        else:
+            graph.graph[node1][node2]['weight'] = layers_np_weights[layer][ind1, ind2]
 
-    for weight_group in graph.duplicated_weights_groups:
+    for i, weight_group in enumerate(graph.duplicated_weights_groups):
         shared_weight = graph.graph.get_edge_data(*next(iter(weight_group))).get('weight') \
             if len(weight_group) != 0 else None
         for edge in weight_group:
@@ -170,3 +191,81 @@ def update_graph_weights(
 
     for (layer, ind), node in net_graph_biases_mapping.items():
         graph.graph.nodes[node]['weight'] = layer.b[ind]
+
+
+def train_model(model, train_dataset, val_dataset, duplicated_weights_edges_map, duplicated_weights_groups, epochs=50,
+                lr=5e-4):
+    @tf.function
+    def train_step(train_images, train_labels):
+        with tf.GradientTape() as tape:
+            predictions = model(train_images, training=True)
+            loss = loss_fn(train_labels, predictions)
+
+        trainable_layers = [layer for layer in model.layers if isinstance(layer, CustomDenseLayer)]
+        trainable_weights, trainable_biases = [], []
+        for layer in trainable_layers:
+            trainable_weights.append(layer.w)
+            if layer.with_biases:
+                trainable_biases.append(layer.b)
+
+        trainable_variables = trainable_weights + trainable_biases
+        grads = tape.gradient(loss, trainable_variables)
+
+        optimizer.apply_gradients(zip(grads, trainable_variables))
+
+        train_loss(loss)
+        train_accuracy(train_labels, predictions)
+
+    @tf.function
+    def val_step(val_images, val_labels):
+        predictions = model(val_images, training=False)
+        v_loss = loss_fn(val_labels, predictions)
+
+        val_loss(v_loss)
+        val_accuracy(val_labels, predictions)
+
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr, weight_decay=1e-3)
+
+    train_loss = tf.keras.metrics.Mean()
+    train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
+    val_loss = tf.keras.metrics.Mean()
+    val_accuracy = tf.keras.metrics.SparseCategoricalAccuracy()
+    val_accuracies = []
+    best_accuracy = 0
+    accuracy_not_updated = 0
+    best_model_weights = None
+    for epoch in range(epochs):
+        accuracy_not_updated += 1
+        train_loss.reset_states()
+        train_accuracy.reset_states()
+        val_loss.reset_states()
+        val_accuracy.reset_states()
+
+        for images, labels in train_dataset:
+            train_step(images, labels)
+
+        for images, labels in val_dataset:
+            val_step(images, labels)
+
+        if val_accuracy.result() > best_accuracy:
+            best_accuracy = val_accuracy.result()
+            accuracy_not_updated = 0
+            best_model_weights = model.get_weights()
+
+        val_accuracies.append(float(val_accuracy.result()))
+
+        if accuracy_not_updated > 12:
+            break
+
+        print(
+            f"Epoch {epoch + 1}, "
+            f"Train loss: {train_loss.result()}, "
+            f"Train accuracy: {train_accuracy.result() * 100}, "
+            f"Val loss: {val_loss.result()}, "
+            f"Val accuracy: {val_accuracy.result() * 100}"
+        )
+
+    model.set_weights(best_model_weights)
+    top_5_accuracies = sorted(val_accuracies, reverse=True)[:5]
+    return sum(top_5_accuracies) / len(top_5_accuracies)
