@@ -312,7 +312,7 @@ class CustomGraph:
             self.duplicated_weights_groups.append(set(group_edges))
             for group_edge in group_edges:
                 self.duplicated_weights_edges.add(group_edge)
-                if isinstance(group_weight, int):
+                if isinstance(group_weight, float):
                     self.graph[group_edge[0]][group_edge[1]]['weight'] = group_weight
 
     def get_coordinates_map(self, custom_node_layer_map=None):

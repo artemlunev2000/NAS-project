@@ -3,17 +3,28 @@ import pickle
 import uuid
 import os
 import math
+import torch
+import numpy as np
+import timeit
+import platform
 from copy import deepcopy
 from typing import List
+if platform.system() != "Windows":
+    from deepsparse import compile_model
 
-from src.model_generator import create_model_from_graph, update_graph_weights, train_model
+from src.model_generator import create_model_from_graph, update_graph_weights, CustomDenseLayer, train_model
 from src.graph_constructor import create_graph
 from src.population_generator import generate_population
+from src.build_onnx_model import CustomGraphModel
 
 
-def get_ranked_population(population):
+def get_ranked_population(population: List[dict]):
     def dominates(a, b):
-        return a["flops"] <= b["flops"] and a["avg_val_acc"] >= b["avg_val_acc"]
+        if platform.system() != "Windows":
+            return a["flops"] <= b["flops"] and a["avg_val_acc"] >= b["avg_val_acc"] \
+                   and a["inference"] <= b["inference"]
+        else:
+            return a["flops"] <= b["flops"] and a["avg_val_acc"] >= b["avg_val_acc"]
 
     n = len(population)
     domination_count = [0] * n
@@ -48,12 +59,93 @@ def get_ranked_population(population):
     return individual_front_map
 
 
+def get_crowding_distance(front: List[dict]):
+    n = len(front)
+
+    distances = [0.0] * n
+    objectives = ["flops", "avg_val_acc", "inference"] if platform.system() != "Windows" else ["flops", "avg_val_acc"]
+
+    for obj in objectives:
+        sorted_indices = sorted(range(n), key=lambda i: front[i][obj])
+
+        obj_min = front[sorted_indices[0]][obj]
+        obj_max = front[sorted_indices[-1]][obj]
+
+        if obj_max == obj_min:
+            continue
+
+        distances[sorted_indices[0]] = float('inf')
+        distances[sorted_indices[-1]] = float('inf')
+
+        for k in range(1, n - 1):
+            i = sorted_indices[k]
+            next_val = front[sorted_indices[k + 1]][obj]
+            prev_val = front[sorted_indices[k - 1]][obj]
+            distances[i] += (next_val - prev_val) / (obj_max - obj_min)
+
+    return distances
+
+
+def select_parents_through_tournament(population: List[dict], tournament_size: int, parents_number: int) -> List[dict]:
+    result = []
+    fronts = get_ranked_population(population)
+    for _ in range(parents_number):
+        tournament_individuals = random.sample(population, tournament_size)
+        tournament_fronts = [fronts[population.index(individual)] for individual in tournament_individuals]
+        tournament_individuals = [tournament_individuals[i] for i in range(tournament_size)
+                                  if tournament_fronts[i] == max(tournament_fronts)]
+        if len(tournament_individuals) > 1:
+            max_front = [population[j] for j in fronts.keys() if fronts[j] == max(tournament_fronts)]
+            tournament_individuals_front_indices = [max_front.index(t) for t in tournament_individuals]
+            distances = get_crowding_distance(max_front)
+            distances = [distances[ind] for ind in tournament_individuals_front_indices]
+            result.append(
+                tournament_individuals[distances.index(max(distances))]
+            )
+        else:
+            result.append(tournament_individuals[0])
+
+    return result
+
+
+def calculate_deepsparse_inference(
+        population: List[dict], graphs_folder: str, input_nodes: int, calculations_number: int = 1000
+):
+    if platform.system() == "Windows":
+        return
+    batch_size = 100
+    dummy_input = torch.randn(batch_size, input_nodes)
+    onnx_filename = "tmp.onnx"
+    input_data = [np.random.randn(batch_size, input_nodes).astype(np.float32)]
+
+    for model_info in population:
+        if "inference" in model_info:
+            continue
+        with open(f'{graphs_folder}/{model_info["graph_id"]}.pkl', "rb") as file:
+            graph = pickle.load(file)
+        model = CustomGraphModel(graph)
+        torch.onnx.export(
+            model,
+            dummy_input,
+            onnx_filename,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={
+                "input": {0: "batch_size"},
+                "output": {0: "batch_size"}
+            }
+        )
+        engine = compile_model(onnx_filename, batch_size)
+        model_info["inference"] = timeit.timeit(lambda: engine(input_data), number=calculations_number)
+
+
 def optimized_architecture_search(
     train_dataset, val_dataset, test_dataset,
     input_shape: tuple, output_nodes: int,
     iterations_number: int = 10, mutations_per_iteration: int = 15,
-    initial_population_number: int = 60, initial_population_architectures: List[dict] = None,
-    start_population_file: str = None, graphs_folder=None, start_iteration=0
+    initial_population_number: int = 60, tournament_size: int = 3,
+    initial_population_architectures: List[dict] = None, start_population_file: str = None,
+    graphs_folder=None, start_iteration=0
 ):
     if not graphs_folder:
         graphs_folder = f'graphs_savings/evolution/{uuid.uuid4()}'
@@ -108,16 +200,14 @@ def optimized_architecture_search(
         output_nodes=output_nodes, train_dataset=train_dataset, val_dataset=val_dataset,
         graphs_folder=graphs_folder
     )
-    is_ended_iteration = 1 if len(population) == 60 else 0
+    is_ended_iteration = 1 if len(population) == initial_population_number else 0
+    calculate_deepsparse_inference(population, graphs_folder, input_nodes)
     for iteration in range(iterations_number - start_iteration):
-        models_to_mutate = []
-        fronts = get_ranked_population(population)
-        for _ in range(60 + mutations_per_iteration - len(population)):
-            tournament_individuals = random.sample(population, 3)
-            tournament_fronts = [fronts[population.index(individual)] for individual in tournament_individuals]
-            tournament_individuals = [tournament_individuals[i] for i in range(3)
-                                      if tournament_fronts[i] == max(tournament_fronts)]
-            models_to_mutate.append(random.choice(tournament_individuals))
+        models_to_mutate = select_parents_through_tournament(
+            population,
+            tournament_size,
+            initial_population_number + mutations_per_iteration - len(population)
+        )
 
         for model_info in models_to_mutate:
             with open(f'{graphs_folder}/{model_info["graph_id"]}.pkl', "rb") as file:
@@ -158,6 +248,7 @@ def optimized_architecture_search(
             with open(f"{graphs_folder}/{start_iteration + iteration + is_ended_iteration}.pkl", "wb") as file:
                 pickle.dump(population, file)
 
+        calculate_deepsparse_inference(population, graphs_folder, input_nodes)
         population = population[mutations_per_iteration:]
         with open(f"{graphs_folder}/{start_iteration + iteration + is_ended_iteration}.pkl", "wb") as file:
             pickle.dump(population, file)

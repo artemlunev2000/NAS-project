@@ -147,10 +147,9 @@ def create_model_from_graph(graph: CustomGraph, normalization='layer', without_s
     for current_layer in range(1, last_layer_number + 1):
         activation = tf.keras.activations.softmax if current_layer == last_layer_number else tf.keras.activations.relu
         layer_result = \
-            tf.reduce_sum(
+            tf.keras.layers.Add()(
                 [keras_layers[current_layer][layer_from](layers_results[layer_from])
-                 for layer_from in keras_layers[current_layer].keys()],
-                axis=0
+                 for layer_from in keras_layers[current_layer].keys()]
             )
         if normalization and current_layer != last_layer_number:
             if normalization == 'batch':
