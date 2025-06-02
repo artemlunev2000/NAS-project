@@ -15,7 +15,7 @@ if platform.system() != "Windows":
 from src.model_generator import create_model_from_graph, update_graph_weights, CustomDenseLayer, train_model
 from src.graph_constructor import create_graph
 from src.population_generator import generate_population
-from src.build_onnx_model import CustomGraphModel
+from src.build_onnx_model import build_onnx_model
 
 
 def get_ranked_population(population: List[dict]):
@@ -74,8 +74,10 @@ def get_crowding_distance(front: List[dict]):
         if obj_max == obj_min:
             continue
 
-        distances[sorted_indices[0]] = float('inf')
-        distances[sorted_indices[-1]] = float('inf')
+        distances[sorted_indices[0]] += \
+            2 * (front[sorted_indices[1]][obj] - front[sorted_indices[0]][obj]) / (obj_max - obj_min)
+        distances[sorted_indices[-1]] += \
+            2 * (front[sorted_indices[-1]][obj] - front[sorted_indices[-2]][obj]) / (obj_max - obj_min)
 
         for k in range(1, n - 1):
             i = sorted_indices[k]
@@ -93,11 +95,11 @@ def select_parents_through_tournament(population: List[dict], tournament_size: i
         tournament_individuals = random.sample(population, tournament_size)
         tournament_fronts = [fronts[population.index(individual)] for individual in tournament_individuals]
         tournament_individuals = [tournament_individuals[i] for i in range(tournament_size)
-                                  if tournament_fronts[i] == max(tournament_fronts)]
+                                  if tournament_fronts[i] == min(tournament_fronts)]
         if len(tournament_individuals) > 1:
-            max_front = [population[j] for j in fronts.keys() if fronts[j] == max(tournament_fronts)]
-            tournament_individuals_front_indices = [max_front.index(t) for t in tournament_individuals]
-            distances = get_crowding_distance(max_front)
+            min_front = [population[j] for j in fronts.keys() if fronts[j] == min(tournament_fronts)]
+            tournament_individuals_front_indices = [min_front.index(t) for t in tournament_individuals]
+            distances = get_crowding_distance(min_front)
             distances = [distances[ind] for ind in tournament_individuals_front_indices]
             result.append(
                 tournament_individuals[distances.index(max(distances))]
@@ -113,7 +115,7 @@ def calculate_deepsparse_inference(
 ):
     if platform.system() == "Windows":
         return
-    batch_size = 100
+    batch_size = 128
     dummy_input = torch.randn(batch_size, input_nodes)
     onnx_filename = "tmp.onnx"
     input_data = [np.random.randn(batch_size, input_nodes).astype(np.float32)]
@@ -123,29 +125,22 @@ def calculate_deepsparse_inference(
             continue
         with open(f'{graphs_folder}/{model_info["graph_id"]}.pkl', "rb") as file:
             graph = pickle.load(file)
-        model = CustomGraphModel(graph)
-        torch.onnx.export(
-            model,
-            dummy_input,
-            onnx_filename,
-            input_names=["input"],
-            output_names=["output"],
-            dynamic_axes={
-                "input": {0: "batch_size"},
-                "output": {0: "batch_size"}
-            }
-        )
+        build_onnx_model(graph, dummy_input, onnx_filename)
         engine = compile_model(onnx_filename, batch_size)
-        model_info["inference"] = timeit.timeit(lambda: engine(input_data), number=calculations_number)
+        inference = 0
+        for _ in range(3):
+            inference += timeit.timeit(lambda: engine(input_data), number=calculations_number)
+
+        model_info["inference"] = inference / 3
 
 
-def optimized_architecture_search(
-    train_dataset, val_dataset, test_dataset,
-    input_shape: tuple, output_nodes: int,
-    iterations_number: int = 10, mutations_per_iteration: int = 15,
-    initial_population_number: int = 60, tournament_size: int = 3,
-    initial_population_architectures: List[dict] = None, start_population_file: str = None,
-    graphs_folder=None, start_iteration=0
+def architecture_search(
+        train_dataset, val_dataset, test_dataset,
+        input_shape: tuple, output_nodes: int,
+        iterations_number: int = 10, mutations_per_iteration: int = 15,
+        initial_population_number: int = 60, tournament_size: int = 3,
+        initial_population_architectures: List[dict] = None, start_population_file: str = None,
+        graphs_folder=None, start_iteration=0
 ):
     if not graphs_folder:
         graphs_folder = f'graphs_savings/evolution/{uuid.uuid4()}'
@@ -179,12 +174,12 @@ def optimized_architecture_search(
                     duplicated_weights_edges_map,
                     net_graph_weights_mapping,
                     net_graph_biases_mapping
-                ) = create_model_from_graph(graph, normalization='layer', without_start_weights=False)
-                avg_val_acc = train_model(model, train_dataset, val_dataset, duplicated_weights_edges_map,
-                                          graph.duplicated_weights_groups, epochs=50, lr=0.9e-3)
+                ) = create_model_from_graph(graph, normalization=None, without_start_weights=False)
+                avg_val_acc, val_accuracy = train_model(
+                    model, train_dataset, val_dataset, duplicated_weights_edges_map,
+                    graph.duplicated_weights_groups, epochs=60, lr=1e-3
+                )
                 update_graph_weights(graph, net_graph_weights_mapping, net_graph_biases_mapping)
-                model.compile(loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-                _, val_accuracy = model.evaluate(val_dataset)
                 graph_id = uuid.uuid4()
                 population.append(
                     {'graph_id': graph_id, 'acc': val_accuracy, 'avg_val_acc': avg_val_acc,
@@ -212,12 +207,13 @@ def optimized_architecture_search(
         for model_info in models_to_mutate:
             with open(f'{graphs_folder}/{model_info["graph_id"]}.pkl', "rb") as file:
                 graph = pickle.load(file)
-            action = random.randint(0, 2)
+            action = random.randint(0, 2) if graph.flops > 70000 else random.randint(0, 1)
 
+            new_pairs = None
             if action == 0:
-                graph.add_new_edges()
+                new_pairs = graph.add_new_edges()
             if action == 1:
-                graph.add_new_nodes_with_edges()
+                new_pairs = graph.add_new_nodes_with_edges()
             if action == 2:
                 graph.remove_edges()
 
@@ -226,16 +222,32 @@ def optimized_architecture_search(
                 duplicated_weights_edges_map,
                 net_graph_weights_mapping,
                 net_graph_biases_mapping
-            ) = create_model_from_graph(graph, normalization='layer', without_start_weights=False)
+            ) = create_model_from_graph(graph, normalization=None, without_start_weights=False, new_pairs=new_pairs)
 
-            avg_val_acc = train_model(
-                model, train_dataset, val_dataset,
-                duplicated_weights_edges_map, graph.duplicated_weights_groups, lr=0.6e-3, epochs=50
-            )
+            if new_pairs is not None:
+                avg_val_acc1, val_accuracy1 = train_model(
+                    model, train_dataset, val_dataset,
+                    duplicated_weights_edges_map, graph.duplicated_weights_groups, lr=5e-4, epochs=15, train_all=False
+                )
+                avg_val_acc2, val_accuracy2 = train_model(
+                    model, train_dataset, val_dataset,
+                    duplicated_weights_edges_map, graph.duplicated_weights_groups, lr=1e-4, epochs=20, train_all=True
+                )
+                avg_val_acc = max(avg_val_acc1, avg_val_acc2)
+                val_accuracy = max(val_accuracy1, val_accuracy2)
+            else:
+                avg_val_acc1, val_accuracy1 = train_model(
+                    model, train_dataset, val_dataset,
+                    duplicated_weights_edges_map, graph.duplicated_weights_groups, lr=7e-4, epochs=40
+                )
+                avg_val_acc2, val_accuracy2 = train_model(
+                    model, train_dataset, val_dataset,
+                    duplicated_weights_edges_map, graph.duplicated_weights_groups, lr=1e-4, epochs=10
+                )
+                avg_val_acc = max(avg_val_acc1, avg_val_acc2)
+                val_accuracy = max(val_accuracy1, val_accuracy2)
 
             update_graph_weights(graph, net_graph_weights_mapping, net_graph_biases_mapping)
-            model.compile(loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-            _, val_accuracy = model.evaluate(val_dataset)
             graph_id = uuid.uuid4()
             population.append({
                 'graph_id': graph_id, 'acc': val_accuracy, 'avg_val_acc': avg_val_acc,

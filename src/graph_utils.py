@@ -138,7 +138,7 @@ class CustomGraph:
                     edges_num_to_add // len(residual_pairs) // 9,
                     edges_num_to_add // len(residual_pairs) // 4.5
                 )),
-                2500
+                4000
             )
             for _ in range(len(residual_pairs))
         ]
@@ -147,6 +147,9 @@ class CustomGraph:
                 num_edges=edges_num, layer_from=layer_from, layer_to=layer_to,
                 custom_node_layer_map=node_layer_map, full_node_layer_map=full_node_layer_map
             ))
+
+        return [(layer_for_new_nodes - 1, layer_for_new_nodes), (layer_for_new_nodes, layer_for_new_nodes + 1)] + \
+            residual_pairs
 
     def add_new_edges(self, edges_list=None):
         """Add several edges between random nodes"""
@@ -192,6 +195,9 @@ class CustomGraph:
                 self.graph.add_edge(*edge_to_add)
             elif self.new_weights_mode == 'preserving':
                 self.graph.add_edge(*edge_to_add, weight=1e-3)
+
+        if edges_list is None:
+            return layers_pairs
 
     def __cascade_delete_edge(self, edge_to_remove: tuple):
         self.graph.remove_edge(*edge_to_remove)
@@ -320,7 +326,8 @@ class CustomGraph:
         layer_nodes_map = defaultdict(list)
         for node in sorted(node_layer_map.keys()):
             layer_nodes_map[node_layer_map[node]].append(node)
-        coordinates_map = {n: (n // 28, n % 28) for n in self.in_nodes}
+        coordinates_map = {n: ((n % 1024) // 32, (n % 1024) % 32) for n in
+                           self.in_nodes}
 
         for layer in range(1, max(layer_nodes_map.keys())):
             for node in layer_nodes_map[layer]:

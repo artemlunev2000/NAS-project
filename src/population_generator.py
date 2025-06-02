@@ -44,7 +44,7 @@ def generate_population(population, population_num, input_nodes, output_nodes, t
         edges_num = round(np.random.uniform(existed_nodes_num * 5, existed_nodes_num * 20))
         possible_edges_per_layer = np.array(
             [len(layer_nodes_map[layer_num]) * len(layer_nodes_map[layer_num + 1]) *
-             (40 if layer_num == intermediate_layers_number else 1)
+             (60 if layer_num == intermediate_layers_number else 1)
              for layer_num in range(intermediate_layers_number + 1)]
         )
         noise = np.random.uniform(0.85, 1.15, len(possible_edges_per_layer))
@@ -96,7 +96,7 @@ def generate_population(population, population_num, input_nodes, output_nodes, t
                     edges_num // len(residual_layers) // 10,
                     edges_num // len(residual_layers) // 5
                 )),
-                2500
+                4000
             )
             for _ in range(len(residual_layers))
         ]
@@ -109,14 +109,12 @@ def generate_population(population, population_num, input_nodes, output_nodes, t
                 graph.add_new_edges(edges_list=edges)
 
         model, duplicated_weights_edges_map, net_graph_weights_mapping, net_graph_biases_mapping = \
-            create_model_from_graph(graph, normalization='layer', without_start_weights=True)
-        avg_val_acc = train_model(
-            model, train_dataset, val_dataset, duplicated_weights_edges_map, graph.duplicated_weights_groups, lr=0.8e-3,
-            epochs=55
+            create_model_from_graph(graph, normalization=None, without_start_weights=True)
+        avg_val_acc, val_accuracy = train_model(
+            model, train_dataset, val_dataset, duplicated_weights_edges_map, graph.duplicated_weights_groups, lr=1e-3,
+            epochs=60
         )
         update_graph_weights(graph, net_graph_weights_mapping, net_graph_biases_mapping)
-        model.compile(loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-        _, val_accuracy = model.evaluate(val_dataset)
         graph_id = uuid.uuid4()
         population.append({
             'graph_id': graph_id, 'acc': val_accuracy, 'avg_val_acc': avg_val_acc,

@@ -29,7 +29,7 @@ class SimpleCNN(nn.Module):
         self.conv = nn.Conv2d(in_channels=3, out_channels=4, kernel_size=3)
         self.conv2 = nn.Conv2d(in_channels=4, out_channels=8, kernel_size=3)
         self.pool = nn.MaxPool2d(2, 2)
-        self.fc1 = nn.Linear(1176, 256)
+        self.fc1 = nn.Linear(1568, 256)
         self.fc2 = nn.Linear(256, 10)
 
     def forward(self, x):

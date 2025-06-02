@@ -119,3 +119,18 @@ class CustomGraphModel(nn.Module):
             layer_outputs[current_layer] = summed
 
         return layer_outputs[self.last_layer_number]
+
+
+def build_onnx_model(graph, dummy_input, onnx_filename):
+    model = CustomGraphModel(graph)
+    torch.onnx.export(
+        model,
+        dummy_input,
+        onnx_filename,
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={
+            "input": {0: "batch_size"},
+            "output": {0: "batch_size"}
+        }
+    )
