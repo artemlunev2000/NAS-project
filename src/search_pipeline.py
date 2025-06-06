@@ -137,13 +137,13 @@ def calculate_deepsparse_inference(
 def architecture_search(
         train_dataset, val_dataset, test_dataset,
         input_shape: tuple, output_nodes: int,
-        iterations_number: int = 10, mutations_per_iteration: int = 15,
+        iterations_number: int = 40, mutations_per_iteration: int = 15,
         initial_population_number: int = 60, tournament_size: int = 3,
         initial_population_architectures: List[dict] = None, start_population_file: str = None,
         graphs_folder=None, start_iteration=0
 ):
     if not graphs_folder:
-        graphs_folder = f'graphs_savings/evolution/{uuid.uuid4()}'
+        graphs_folder = f'/graphs_savings/{uuid.uuid4()}'
     os.makedirs(graphs_folder, exist_ok=True)
 
     if start_population_file:
